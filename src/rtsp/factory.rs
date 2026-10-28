@@ -421,11 +421,20 @@ pub(super) async fn make_factory(
                             // happens before the first preroll and again when the RTSP
                             // server resets the media between DESCRIBE and PLAY
                             // (suspend mode Reset). Hold the frames since the last
-                            // keyframe until the pipeline accepts data again.
+                            // keyframe until the pipeline accepts data again. A reset
+                            // pipeline starts a new segment at 0, so the timestamps
+                            // restart too - continuing them made the sink hold the
+                            // first frame for the time already streamed (~2 s).
                             let mut pending: Vec<BcMedia> = buffer;
+                            let mut restarted = false;
                             log::trace!("{name}::{stream}: Sending frames");
                             while let Some(data) = media_rx.blocking_recv() {
                                 if accepts_data(&vid_src) {
+                                    if restarted {
+                                        vid_ts = 0;
+                                        aud_ts = 0;
+                                        restarted = false;
+                                    }
                                     for held in pending.drain(..) {
                                         send_to_sources(
                                             held,
@@ -451,6 +460,7 @@ pub(super) async fn make_factory(
                                     }
                                     r?;
                                 } else {
+                                    restarted = true;
                                     if let Some(app) = vid_src.as_ref() {
                                         check_live(app)?;
                                     }
