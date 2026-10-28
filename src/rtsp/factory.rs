@@ -415,51 +415,54 @@ pub(super) async fn make_factory(
                             let mut vid_ts = 0u32;
                             let mut pools = Default::default();
 
-                            // Frames pushed before the client pipeline is up are
-                            // dropped (appsrc flushing), the keyframe with them, and
-                            // the client then waits for the next keyframe. Hold the
-                            // frames since the last keyframe until it accepts data.
-                            let ready_by = std::time::Instant::now() + Duration::from_secs(10);
-                            while !accepts_data(&vid_src) && std::time::Instant::now() < ready_by {
-                                while let Ok(media) = media_rx.try_recv() {
-                                    if matches!(media, BcMedia::Iframe(_)) {
-                                        buffer.retain(|m| {
+                            // Frames pushed while the client pipeline is not up are
+                            // dropped as flushing, the keyframe with them, and the
+                            // client then waits a whole GOP for the next keyframe. That
+                            // happens before the first preroll and again when the RTSP
+                            // server resets the media between DESCRIBE and PLAY
+                            // (suspend mode Reset). Hold the frames since the last
+                            // keyframe until the pipeline accepts data again.
+                            let mut pending: Vec<BcMedia> = buffer;
+                            log::trace!("{name}::{stream}: Sending frames");
+                            while let Some(data) = media_rx.blocking_recv() {
+                                if accepts_data(&vid_src) {
+                                    for held in pending.drain(..) {
+                                        send_to_sources(
+                                            held,
+                                            &mut pools,
+                                            &vid_src,
+                                            &aud_src,
+                                            &mut vid_ts,
+                                            &mut aud_ts,
+                                            &stream_config,
+                                        )?;
+                                    }
+                                    let r = send_to_sources(
+                                        data,
+                                        &mut pools,
+                                        &vid_src,
+                                        &aud_src,
+                                        &mut vid_ts,
+                                        &mut aud_ts,
+                                        &stream_config,
+                                    );
+                                    if let Err(r) = &r {
+                                        log::info!("Failed to send to source: {r:?}");
+                                    }
+                                    r?;
+                                } else {
+                                    if let Some(app) = vid_src.as_ref() {
+                                        check_live(app)?;
+                                    }
+                                    if matches!(data, BcMedia::Iframe(_)) {
+                                        pending.retain(|m| {
                                             matches!(m, BcMedia::InfoV1(_) | BcMedia::InfoV2(_))
                                         });
                                     }
-                                    buffer.push(media);
+                                    if pending.len() < MAX_GOP {
+                                        pending.push(data);
+                                    }
                                 }
-                                std::thread::sleep(Duration::from_millis(10));
-                            }
-
-                            log::trace!("{name}::{stream}: Sending buffered frames");
-                            for buffered in buffer.drain(..) {
-                                send_to_sources(
-                                    buffered,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                )?;
-                            }
-
-                            log::trace!("{name}::{stream}: Sending new frames");
-                            while let Some(data) = media_rx.blocking_recv() {
-                                let r = send_to_sources(
-                                    data,
-                                    &mut pools,
-                                    &vid_src,
-                                    &aud_src,
-                                    &mut vid_ts,
-                                    &mut aud_ts,
-                                    &stream_config,
-                                );
-                                if let Err(r) = &r {
-                                    log::info!("Failed to send to source: {r:?}");
-                                }
-                                r?;
                             }
                             log::trace!("All media recieved");
                             AnyResult::Ok(())
