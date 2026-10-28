@@ -218,6 +218,21 @@ pub(crate) struct CameraConfig {
 
     #[serde(default = "default_false", alias = "idle", alias = "idle_disc")]
     pub(crate) idle_disconnect: bool,
+
+    /// Pause in ms after login (twice, around the time check) before the camera
+    /// is handed to the streams. Upstream used a fixed 2000 ms.
+    #[serde(default = "default_startup_delay_ms", alias = "startup_delay")]
+    pub(crate) startup_delay_ms: u64,
+
+    /// When false, motion events do not take a permit, so motion alone never
+    /// keeps an idle_disconnect camera connected.
+    #[serde(default = "default_true")]
+    pub(crate) motion_wake: bool,
+
+    /// Seconds the camera stream keeps running after the last RTSP client
+    /// leaves, so that the next client gets frames at once. 0 = stop at once.
+    #[serde(default = "default_stream_linger", alias = "linger")]
+    pub(crate) stream_linger: u64,
 }
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone, PartialEq, Eq, Hash)]
@@ -467,6 +482,14 @@ fn default_channel_id() -> u8 {
 
 fn default_update_time() -> bool {
     false
+}
+
+fn default_startup_delay_ms() -> u64 {
+    2000
+}
+
+fn default_stream_linger() -> u64 {
+    0
 }
 
 fn default_motion_timeout() -> f64 {

@@ -1,5 +1,9 @@
 use gstreamer::ClockTime;
-use std::{collections::HashMap, time::Duration};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
 use anyhow::{anyhow, Context, Result};
 use gstreamer::{prelude::*, Bin, Caps, Element, ElementFactory, FlowError, GhostPad};
@@ -10,7 +14,13 @@ use neolink_core::{
         BcMedia, BcMediaIframe, BcMediaInfoV1, BcMediaInfoV2, BcMediaPframe, VideoType,
     },
 };
-use tokio::{sync::mpsc::channel as mpsc, task::JoinHandle};
+use tokio::{
+    sync::mpsc::{
+        channel as mpsc, error::TrySendError, Receiver as MpscReceiver, Sender as MpscSender,
+    },
+    task::JoinHandle,
+    time::{sleep, Instant},
+};
 
 use crate::{common::NeoInstance, rtsp::gst::NeoMediaFactory, AnyResult};
 
@@ -150,6 +160,162 @@ enum ClientMsg {
     },
 }
 
+/// Frames queued for one client before it is treated as stalled and dropped
+const SUBSCRIBER_BUFFER: usize = 2000;
+/// Upper bound of the cached frames since the last keyframe
+const MAX_GOP: usize = 600;
+
+#[derive(Default)]
+struct HubState {
+    running: bool,
+    subscribers: Vec<MpscSender<BcMedia>>,
+    info: Option<BcMedia>,
+    gop: Vec<BcMedia>,
+}
+
+/// One camera stream shared by all RTSP clients of a factory.
+///
+/// Battery cameras do not accept a second preview request for the same stream
+/// on one connection, so a second client used to break the first one. The hub
+/// starts the camera stream once, fans the frames out to every client and
+/// replays the frames since the last keyframe to a client that joins later.
+/// With `stream_linger` the camera stream outlives the last client for a while,
+/// so a client that follows shortly after gets frames at once.
+#[derive(Clone)]
+struct StreamHub {
+    camera: NeoInstance,
+    stream: StreamKind,
+    state: Arc<Mutex<HubState>>,
+}
+
+impl StreamHub {
+    fn new(camera: NeoInstance, stream: StreamKind) -> Self {
+        Self {
+            camera,
+            stream,
+            state: Default::default(),
+        }
+    }
+
+    async fn subscribe(&self) -> AnyResult<MpscReceiver<BcMedia>> {
+        let (tx, rx) = mpsc(SUBSCRIBER_BUFFER);
+        let start = {
+            let mut state = self.state.lock().unwrap();
+            if let Some(info) = state.info.as_ref() {
+                let _ = tx.try_send(info.clone());
+            }
+            for media in state.gop.iter() {
+                let _ = tx.try_send(media.clone());
+            }
+            state.subscribers.push(tx);
+            let start = !state.running;
+            state.running = true;
+            start
+        };
+        if start {
+            let linger_secs = self.camera.config().await?.borrow().stream_linger;
+            let linger = Duration::from_secs(linger_secs);
+            match self.camera.stream_while_live(self.stream).await {
+                Ok(upstream) => {
+                    let hub = self.clone();
+                    tokio::task::spawn(async move { hub.pump(upstream, linger).await });
+                }
+                Err(e) => {
+                    let mut state = self.state.lock().unwrap();
+                    Self::stop(&mut state);
+                    return Err(e);
+                }
+            }
+        } else {
+            log::debug!("{}: Client joined the running camera stream", self.stream);
+        }
+        Ok(rx)
+    }
+
+    async fn pump(&self, mut upstream: MpscReceiver<BcMedia>, linger: Duration) {
+        let mut idle_since = None;
+        loop {
+            let keep = tokio::select! {
+                v = upstream.recv() => match v {
+                    Some(media) => self.on_media(media, linger, &mut idle_since),
+                    None => {
+                        let mut state = self.state.lock().unwrap();
+                        Self::stop(&mut state);
+                        false
+                    }
+                },
+                _ = sleep(Duration::from_millis(500)) => self.on_tick(linger, &mut idle_since),
+            };
+            if !keep {
+                break;
+            }
+        }
+        log::debug!("{}: Camera stream released", self.stream);
+    }
+
+    fn on_media(
+        &self,
+        media: BcMedia,
+        linger: Duration,
+        idle_since: &mut Option<Instant>,
+    ) -> bool {
+        let mut state = self.state.lock().unwrap();
+        match &media {
+            BcMedia::InfoV1(_) | BcMedia::InfoV2(_) => state.info = Some(media.clone()),
+            BcMedia::Iframe(_) => {
+                state.gop.clear();
+                state.gop.push(media.clone());
+            }
+            _ => {
+                if !state.gop.is_empty() && state.gop.len() < MAX_GOP {
+                    state.gop.push(media.clone());
+                }
+            }
+        }
+        let stream = self.stream;
+        state.subscribers.retain(|sub| match sub.try_send(media.clone()) {
+            Ok(()) => true,
+            Err(TrySendError::Full(_)) => {
+                log::warn!("{stream}: Client is not consuming frames, dropping it");
+                false
+            }
+            Err(TrySendError::Closed(_)) => false,
+        });
+        Self::check_idle(&mut state, linger, idle_since)
+    }
+
+    fn on_tick(&self, linger: Duration, idle_since: &mut Option<Instant>) -> bool {
+        let mut state = self.state.lock().unwrap();
+        state.subscribers.retain(|sub| !sub.is_closed());
+        Self::check_idle(&mut state, linger, idle_since)
+    }
+
+    /// Returns false once the stream has had no clients for `linger`
+    fn check_idle(
+        state: &mut HubState,
+        linger: Duration,
+        idle_since: &mut Option<Instant>,
+    ) -> bool {
+        if state.subscribers.is_empty() {
+            let since = *idle_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= linger {
+                Self::stop(state);
+                return false;
+            }
+        } else {
+            *idle_since = None;
+        }
+        true
+    }
+
+    fn stop(state: &mut HubState) {
+        state.running = false;
+        state.subscribers.clear();
+        state.info = None;
+        state.gop.clear();
+    }
+}
+
 pub(super) async fn make_factory(
     camera: NeoInstance,
     stream: StreamKind,
@@ -158,20 +324,22 @@ pub(super) async fn make_factory(
     // Create the task that creates the pipelines
     let thread = tokio::task::spawn(async move {
         let name = camera.config().await?.borrow().name.clone();
+        let hub = StreamHub::new(camera.clone(), stream);
 
         while let Some(msg) = client_rx.recv().await {
             match msg {
                 ClientMsg::NewClient { element, reply } => {
                     log::debug!("New client for {name}::{stream}");
                     let camera = camera.clone();
+                    let hub = hub.clone();
                     let name = name.clone();
                     tokio::task::spawn(async move {
                         clear_bin(&element)?;
                         log::trace!("{name}::{stream}: Starting camera");
 
-                        // Start the camera
+                        // Start the camera (or join the stream already running)
                         let config = camera.config().await?.borrow().clone();
-                        let mut media_rx = camera.stream_while_live(stream).await?;
+                        let mut media_rx = hub.subscribe().await?;
 
                         log::trace!("{name}::{stream}: Learning camera stream type");
                         // Learn the camera data type

@@ -301,33 +301,38 @@ impl NeoCam {
             });
         }
 
-        // MD permits
-        let md_permit_instance = instance.subscribe().await?;
-        let md_permit_cancel = me.cancel.clone();
-        me.set.spawn(async move {
-            tokio::select! {
-                _ = md_permit_cancel.cancelled() => {
-                    AnyResult::Ok(())
-                },
-                v = async {
-                    let mut md = md_permit_instance.motion().await.with_context(|| "Unable to acquire motion watcher")?;
-                    loop{
-                        md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
-                        let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
-                        md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
-                        // Try waiting for 30s
-                        // If in those 30s we get motion then return to
-                        // loop early to reaquire the permit
-                        tokio::select!{
-                            _ = sleep(Duration::from_secs(30)) => {},
-                            v = md.wait_for(|md| matches!(md, MdState::Start(_))) => {v.with_context(|| "MD Watcher lost")?;},
+        // MD permits (skipped with motion_wake = false: motion must not keep
+        // a battery camera online)
+        if config.motion_wake {
+            let md_permit_instance = instance.subscribe().await?;
+            let md_permit_cancel = me.cancel.clone();
+            me.set.spawn(async move {
+                tokio::select! {
+                    _ = md_permit_cancel.cancelled() => {
+                        AnyResult::Ok(())
+                    },
+                    v = async {
+                        let mut md = md_permit_instance.motion().await.with_context(|| "Unable to acquire motion watcher")?;
+                        loop{
+                            md.wait_for(|md| matches!(md, MdState::Start(_))).await.with_context(|| "MD Watcher lost")?;
+                            let _permit = md_permit_instance.permit().await.with_context(|| "Unuable to acquire motion permit")?;
+                            md.wait_for(|md| matches!(md, MdState::Stop(_))).await.with_context(|| "MD Watcher lost")?;
+                            // Try waiting for 30s
+                            // If in those 30s we get motion then return to
+                            // loop early to reaquire the permit
+                            tokio::select!{
+                                _ = sleep(Duration::from_secs(30)) => {},
+                                v = md.wait_for(|md| matches!(md, MdState::Start(_))) => {v.with_context(|| "MD Watcher lost")?;},
+                            }
                         }
-                    }
-                } => {
-                    v
-                },
-            }
-        });
+                    } => {
+                        v
+                    },
+                }
+            });
+        } else {
+            log::info!("{}: Motion does not wake the camera (motion_wake = false)", config.name);
+        }
 
         // This thread will apply battery saving by disconnecting the camera when there are no
         // active permits.
