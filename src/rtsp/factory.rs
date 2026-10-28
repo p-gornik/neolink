@@ -425,15 +425,20 @@ pub(super) async fn make_factory(
                             // pipeline starts a new segment at 0, so the timestamps
                             // restart too - continuing them made the sink hold the
                             // first frame for the time already streamed (~2 s).
+                            let mut gop: Vec<BcMedia> = Vec::new();
+                            for media in buffer.iter() {
+                                remember(&mut gop, media.clone());
+                            }
                             let mut pending: Vec<BcMedia> = buffer;
-                            let mut restarted = false;
+                            let mut holding = true;
                             log::trace!("{name}::{stream}: Sending frames");
                             while let Some(data) = media_rx.blocking_recv() {
+                                remember(&mut gop, data.clone());
                                 if accepts_data(&vid_src) {
-                                    if restarted {
+                                    if holding {
                                         vid_ts = 0;
                                         aud_ts = 0;
-                                        restarted = false;
+                                        holding = false;
                                     }
                                     for held in pending.drain(..) {
                                         send_to_sources(
@@ -460,17 +465,16 @@ pub(super) async fn make_factory(
                                     }
                                     r?;
                                 } else {
-                                    restarted = true;
+                                    if holding {
+                                        remember(&mut pending, data);
+                                    } else {
+                                        // Pipeline just went down: what it had is lost,
+                                        // start again from the last keyframe
+                                        holding = true;
+                                        pending = gop.clone();
+                                    }
                                     if let Some(app) = vid_src.as_ref() {
                                         check_live(app)?;
-                                    }
-                                    if matches!(data, BcMedia::Iframe(_)) {
-                                        pending.retain(|m| {
-                                            matches!(m, BcMedia::InfoV1(_) | BcMedia::InfoV2(_))
-                                        });
-                                    }
-                                    if pending.len() < MAX_GOP {
-                                        pending.push(data);
                                     }
                                 }
                             }
@@ -642,6 +646,16 @@ fn send_to_appsrc(
     }
     Ok(())
 }
+/// Keeps the frames since the last keyframe (stream info frames stay)
+fn remember(gop: &mut Vec<BcMedia>, media: BcMedia) {
+    if matches!(media, BcMedia::Iframe(_)) {
+        gop.retain(|m| matches!(m, BcMedia::InfoV1(_) | BcMedia::InfoV2(_)));
+    }
+    if gop.len() < MAX_GOP {
+        gop.push(media);
+    }
+}
+
 fn accepts_data(src: &Option<AppSrc>) -> bool {
     src.as_ref()
         .map(|app| {
