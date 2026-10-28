@@ -415,6 +415,23 @@ pub(super) async fn make_factory(
                             let mut vid_ts = 0u32;
                             let mut pools = Default::default();
 
+                            // Frames pushed before the client pipeline is up are
+                            // dropped (appsrc flushing), the keyframe with them, and
+                            // the client then waits for the next keyframe. Hold the
+                            // frames since the last keyframe until it accepts data.
+                            let ready_by = std::time::Instant::now() + Duration::from_secs(10);
+                            while !accepts_data(&vid_src) && std::time::Instant::now() < ready_by {
+                                while let Ok(media) = media_rx.try_recv() {
+                                    if matches!(media, BcMedia::Iframe(_)) {
+                                        buffer.retain(|m| {
+                                            matches!(m, BcMedia::InfoV1(_) | BcMedia::InfoV2(_))
+                                        });
+                                    }
+                                    buffer.push(media);
+                                }
+                                std::thread::sleep(Duration::from_millis(10));
+                            }
+
                             log::trace!("{name}::{stream}: Sending buffered frames");
                             for buffered in buffer.drain(..) {
                                 send_to_sources(
@@ -612,6 +629,17 @@ fn send_to_appsrc(
     }
     Ok(())
 }
+fn accepts_data(src: &Option<AppSrc>) -> bool {
+    src.as_ref()
+        .map(|app| {
+            matches!(
+                app.current_state(),
+                gstreamer::State::Paused | gstreamer::State::Playing
+            )
+        })
+        .unwrap_or(true)
+}
+
 fn check_live(app: &AppSrc) -> Result<()> {
     app.bus().ok_or(anyhow!("App source is closed"))?;
     app.pads()
